@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -14,6 +14,17 @@ app = FastAPI(
     description="统一接口调用多种免费LLM后端",
     version="1.0.0"
 )
+
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.gateway_api_key:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid token format")
+        
+        token = authorization.split(" ")[1]
+        if token != settings.gateway_api_key:
+            raise HTTPException(status_code=401, detail="Unauthorized: Invalid API Key")
+    return authorization
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,6 +47,10 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     stream: Optional[bool] = False
+    failover: Optional[bool] = False
+    failover_order: Optional[List[str]] = None
+    api_keys: Optional[List[str]] = None
+
 
 
 class ChatResponse(BaseModel):
@@ -107,71 +122,164 @@ async def list_models(provider_name: str):
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    provider_str = request.provider or settings.default_provider.value
-    try:
-        provider = LLMProvider(provider_str)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Unknown provider: {provider_str}")
+async def chat(request: ChatRequest, _ = Depends(verify_api_key)):
+    providers_to_try = []
+    if request.failover:
+        order = request.failover_order or settings.failover_order
+        # 確保順序中包含當前請求的 provider (如果有的話且不在順序中)
+        if request.provider and request.provider not in order:
+            providers_to_try.append(request.provider)
+        providers_to_try.extend(order)
+        # 去重但保持順序
+        providers_to_try = list(dict.fromkeys(providers_to_try))
+    else:
+        providers_to_try = [request.provider or settings.default_provider.value]
     
-    client = get_client(provider)
-    
-    if not await client.is_available():
-        raise HTTPException(status_code=503, detail=f"Provider {provider_str} is not available")
-    
-    messages = [ChatMessage(role=m.role, content=m.content) for m in request.messages]
-    model = request.model or settings.default_model
-    temperature = request.temperature or settings.temperature
-    max_tokens = request.max_tokens or settings.max_tokens
-    
-    try:
-        response = await client.chat(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-        return ChatResponse(
-            content=response.content,
-            model=response.model,
-            provider=response.provider,
-            tokens_used=response.tokens_used,
-            finish_reason=response.finish_reason
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    last_error = None
+    for provider_str in providers_to_try:
+        try:
+            provider = LLMProvider(provider_str)
+            
+            # 獲取該 Provider 可用的 API Keys
+            # 如果目前嘗試的是 request.provider，則使用傳入的 api_keys
+            keys_to_try = [""] # 預設至少嘗試一次 (針對不需要 Key 的本地模型)
+            if provider_str == request.provider and request.api_keys:
+                keys_to_try = [k for k in request.api_keys if k.strip()]
+            
+            # 如果沒有傳入 Key 或是其他故障轉移後的 Provider，則嘗試從設定檔獲取單一 Key
+            if not keys_to_try:
+                if provider_str == "groq" and settings.groq_api_key:
+                    keys_to_try = [settings.groq_api_key]
+                else:
+                    keys_to_try = [""]
+
+            for api_key in keys_to_try:
+                try:
+                    # 動態建立帶有特定 API Key 的 client
+                    # 這裡稍微重構 get_client 的概念
+                    if provider == LLMProvider.GROQ:
+                        client = GroqClient(api_key=api_key)
+                    elif provider == LLMProvider.OLLAMA:
+                        client = OllamaClient()
+                    elif provider == LLMProvider.VLLM:
+                        client = VLLMClient()
+                    elif provider == LLMProvider.LM_STUDIO:
+                        client = LMStudioClient()
+                    else:
+                        client = get_client(provider)
+                    
+                    if not await client.is_available():
+                        continue
+                        
+                    messages = [ChatMessage(role=m.role, content=m.content) for m in request.messages]
+                    model = request.model or settings.default_model
+                    
+                    response = await client.chat(
+                        messages=messages,
+                        model=model,
+                        temperature=request.temperature or settings.temperature,
+                        max_tokens=request.max_tokens or settings.max_tokens
+                    )
+                    return ChatResponse(
+                        content=response.content,
+                        model=response.model,
+                        provider=response.provider,
+                        tokens_used=response.tokens_used,
+                        finish_reason=response.finish_reason
+                    )
+                except Exception as key_e:
+                    last_error = key_e
+                    print(f"Key for {provider_str} failed: {str(key_e)}")
+                    continue # 嘗試下一個 Key
+                    
+        except Exception as e:
+            last_error = e
+            print(f"Provider {provider_str} failed: {str(e)}")
+            continue
+            
+    raise HTTPException(status_code=500, detail=f"All attempts failed. Last error: {str(last_error)}")
 
 
 @app.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
-    provider_str = request.provider or settings.default_provider.value
-    try:
-        provider = LLMProvider(provider_str)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Unknown provider: {provider_str}")
-    
-    client = get_client(provider)
-    
-    if not await client.is_available():
-        raise HTTPException(status_code=503, detail=f"Provider {provider_str} is not available")
-    
-    messages = [ChatMessage(role=m.role, content=m.content) for m in request.messages]
-    model = request.model or settings.default_model
-    temperature = request.temperature or settings.temperature
-    max_tokens = request.max_tokens or settings.max_tokens
+async def chat_stream(request: ChatRequest, _ = Depends(verify_api_key)):
+    providers_to_try = []
+    if request.failover:
+        order = request.failover_order or settings.failover_order
+        if request.provider and request.provider not in order:
+            providers_to_try.append(request.provider)
+        providers_to_try.extend(order)
+        providers_to_try = list(dict.fromkeys(providers_to_try))
+    else:
+        providers_to_try = [request.provider or settings.default_provider.value]
     
     async def generate():
-        try:
-            async for chunk in client.chat_stream(
-                messages=messages,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens
-            ):
-                yield f"data: {json.dumps({'content': chunk})}\n\n"
-            yield "data: [DONE]\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        last_error = None
+        for provider_str in providers_to_try:
+            try:
+                provider = LLMProvider(provider_str)
+                
+                # 獲取 API Keys
+                keys_to_try = [""]
+                if provider_str == request.provider and request.api_keys:
+                    keys_to_try = [k for k in request.api_keys if k.strip()]
+                
+                if not keys_to_try:
+                    if provider_str == "groq" and settings.groq_api_key:
+                        keys_to_try = [settings.groq_api_key]
+                    else:
+                        keys_to_try = [""]
+
+                for api_key in keys_to_try:
+                    try:
+                        # 動態建立 client
+                        if provider == LLMProvider.GROQ:
+                            client = GroqClient(api_key=api_key)
+                        elif provider == LLMProvider.OLLAMA:
+                            client = OllamaClient()
+                        elif provider == LLMProvider.VLLM:
+                            client = VLLMClient()
+                        elif provider == LLMProvider.LM_STUDIO:
+                            client = LMStudioClient()
+                        else:
+                            client = get_client(provider)
+                        
+                        if not await client.is_available():
+                            continue
+                        
+                        messages = [ChatMessage(role=m.role, content=m.content) for m in request.messages]
+                        model = request.model or settings.default_model
+                        
+                        has_yielded = False
+                        try:
+                            async for chunk in client.chat_stream(
+                                messages=messages,
+                                model=model,
+                                temperature=request.temperature or settings.temperature,
+                                max_tokens=request.max_tokens or settings.max_tokens
+                            ):
+                                yield f"data: {json.dumps({'content': chunk, 'provider': provider_str})}\n\n"
+                                has_yielded = True
+                            
+                            if has_yielded:
+                                yield "data: [DONE]\n\n"
+                                return
+                        except Exception as inner_e:
+                            if has_yielded:
+                                yield f"data: {json.dumps({'error': f'Stream interrupted: {str(inner_e)}'})}\n\n"
+                                return
+                            else:
+                                raise inner_e # 尚未輸出，嘗試下一個 Key 或 Provider
+                    except Exception as key_e:
+                        last_error = key_e
+                        print(f"Key for {provider_str} failed in stream: {str(key_e)}")
+                        continue
+                        
+            except Exception as e:
+                last_error = e
+                print(f"Provider {provider_str} failed in stream: {str(e)}")
+                continue
+        
+        yield f"data: {json.dumps({'error': f'All attempts failed. Last error: {str(last_error)}'})}\n\n"
     
     return StreamingResponse(
         generate(),
@@ -196,7 +304,7 @@ class ProxyRequest(BaseModel):
 
 
 @app.post("/proxy")
-async def proxy_request(request: ProxyRequest):
+async def proxy_request(request: ProxyRequest, _ = Depends(verify_api_key)):
     import httpx
     
     headers = {k: v for k, v in request.headers.items() if k.lower() != 'host'}

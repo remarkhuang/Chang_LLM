@@ -21,12 +21,16 @@ class Settings(BaseSettings):
     groq_base_url: str = "https://api.groq.com/openai/v1"
     
     groq_api_key: Optional[str] = None
+    gateway_api_key: Optional[str] = None
+    
     
     default_provider: LLMProvider = LLMProvider.OLLAMA
     default_model: str = "llama2"
     
     max_tokens: int = 2048
     temperature: float = 0.7
+    failover_order: list[str] = ["groq", "gemini", "openrouter"]
+    
     
     class Config:
         env_file = ".env"
